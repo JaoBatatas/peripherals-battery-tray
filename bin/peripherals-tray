@@ -1,0 +1,436 @@
+#!/usr/bin/env python3
+import glob
+import importlib.machinery
+import importlib.util
+import os
+import select
+import signal
+import subprocess
+import sys
+import threading
+import time
+from PyQt6.QtCore import QObject, Qt, QPointF, QTimer, pyqtSignal
+from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap, QPolygonF
+from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
+
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+BATTERY_SCRIPT = os.path.join(SCRIPT_DIR, "peripherals-battery")
+loader = importlib.machinery.SourceFileLoader("peripherals_battery", BATTERY_SCRIPT)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+pb = importlib.util.module_from_spec(spec)
+loader.exec_module(pb)
+
+MOUSE_POLL_INTERVAL = 60
+AUDIO_CHECK_INTERVAL = 2
+HEADSET_IDLE_REQUIRED = 60
+HEADSET_MIN_AUTO_INTERVAL = 60
+
+PLASMA_WHITE = QColor("#fcfcfc")
+
+IGNORED_AUDIO_APPS = (
+    "gpu screen recorder",
+    "gpu-screen-recorder",
+    "gsr-kms-server",
+    "obs",
+)
+
+
+def is_any_audio_or_mic_active() -> bool:
+    try:
+        out_sinks = subprocess.check_output(
+            ["pactl", "list", "sink-inputs"], text=True, stderr=subprocess.DEVNULL, timeout=1
+        )
+        for block in out_sinks.split("\n\n"):
+            if "Sink Input #" in block and "Corked: no" in block:
+                lower = block.lower()
+                if not any(app in lower for app in IGNORED_AUDIO_APPS):
+                    return True
+
+        out_sources = subprocess.check_output(
+            ["pactl", "list", "source-outputs"], text=True, stderr=subprocess.DEVNULL, timeout=1
+        )
+        for block in out_sources.split("\n\n"):
+            if "Source Output #" in block and "Corked: no" in block:
+                lower = block.lower()
+                if any(app in lower for app in IGNORED_AUDIO_APPS) and "monitor" in lower:
+                    continue
+                if not any(app in lower for app in IGNORED_AUDIO_APPS):
+                    return True
+    except Exception:
+        for id_path in glob.glob("/proc/asound/card*/id"):
+            try:
+                with open(id_path, "r") as f:
+                    if "G435" not in f.read().upper():
+                        continue
+                card_dir = os.path.dirname(id_path)
+                for status_path in glob.glob(os.path.join(card_dir, "pcm*", "sub*", "status")):
+                    with open(status_path, "r") as sf:
+                        if "RUNNING" in sf.read():
+                            return True
+            except Exception:
+                pass
+
+    return False
+
+
+def find_redragon_input_devices() -> list[str]:
+    found = set()
+    for link in glob.glob("/dev/input/by-id/*CX*event-mouse*") + glob.glob("/dev/input/by-id/*3554*event-mouse*"):
+        if os.path.exists(link):
+            found.add(os.path.realpath(link))
+
+    for event_dir in glob.glob("/sys/class/input/event*"):
+        uevent_path = os.path.join(event_dir, "device", "uevent")
+        try:
+            with open(uevent_path, "r") as f:
+                content = f.read().upper()
+            if "00003554:0000F5D5" in content or "00003554:0000F55E" in content:
+                dev_node = os.path.join("/dev/input", os.path.basename(event_dir))
+                if os.path.exists(dev_node):
+                    found.add(dev_node)
+        except Exception:
+            pass
+    return list(found)
+
+
+def get_kde_session_idle_ms() -> int | None:
+    try:
+        out = subprocess.check_output(
+            [
+                "qdbus6",
+                "org.freedesktop.ScreenSaver",
+                "/ScreenSaver",
+                "org.freedesktop.ScreenSaver.GetSessionIdleTime",
+            ],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=1,
+        ).strip()
+        return int(out)
+    except Exception:
+        return None
+
+
+class MouseWakeWatcher(QObject):
+    """Event-driven evdev listener (0% CPU via select) with KDE ScreenSaver D-Bus fallback."""
+    mouse_woke_up = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self.is_sleeping = False
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _run(self) -> None:
+        fds = []
+        last_scan = 0.0
+        last_idle_ms = 0
+
+        while not self._stop_event.is_set():
+            now = time.monotonic()
+            if not fds or (now - last_scan) > 10.0:
+                new_paths = find_redragon_input_devices()
+                if new_paths:
+                    for fd in fds:
+                        try:
+                            os.close(fd)
+                        except Exception:
+                            pass
+                    fds = []
+                    for p in new_paths:
+                        try:
+                            fds.append(os.open(p, os.O_RDONLY | os.O_NONBLOCK))
+                        except Exception:
+                            pass
+                last_scan = now
+
+            if fds:
+                try:
+                    readable, _, _ = select.select(fds, [], [], 1.0)
+                    if readable:
+                        for fd in readable:
+                            try:
+                                while os.read(fd, 4096):
+                                    pass
+                            except BlockingIOError:
+                                pass
+                            except OSError:
+                                for old_fd in fds:
+                                    try:
+                                        os.close(old_fd)
+                                    except Exception:
+                                        pass
+                                fds = []
+                                break
+
+                        if self.is_sleeping:
+                            self.is_sleeping = False
+                            self.mouse_woke_up.emit()
+                except Exception:
+                    time.sleep(1.0)
+            else:
+                time.sleep(1.0)
+                if self.is_sleeping:
+                    idle_ms = get_kde_session_idle_ms()
+                    if idle_ms is not None:
+                        if idle_ms < last_idle_ms or idle_ms < 1500:
+                            self.is_sleeping = False
+                            self.mouse_woke_up.emit()
+                        last_idle_ms = idle_ms
+
+
+def tint_symbolic_icon(symbolic_names: list[str], target_size: int, color: QColor) -> QPixmap:
+    base_icon = QIcon()
+    for name in symbolic_names:
+        candidate = QIcon.fromTheme(name)
+        if not candidate.isNull():
+            base_icon = candidate
+            break
+
+    tinted = QPixmap(target_size, target_size)
+    tinted.fill(Qt.GlobalColor.transparent)
+
+    p = QPainter(tinted)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    base_icon.paint(p, 0, 0, target_size, target_size)
+    p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+    p.fillRect(tinted.rect(), color)
+    p.end()
+    return tinted
+
+
+def draw_charging_bolt(painter: QPainter) -> None:
+    bolt = QPolygonF([
+        QPointF(54, 1),
+        QPointF(39, 19),
+        QPointF(48, 19),
+        QPointF(43, 35),
+        QPointF(62, 15),
+        QPointF(52, 15),
+    ])
+
+    painter.setPen(
+        QPen(
+            QColor(18, 20, 23, 250),
+            3.2,
+            Qt.PenStyle.SolidLine,
+            Qt.PenCapStyle.RoundCap,
+            Qt.PenJoinStyle.RoundJoin,
+        )
+    )
+    painter.setBrush(QColor("#f1c40f"))
+    painter.drawPolygon(bolt)
+
+
+def build_minimal_icon(symbolic_names: list[str], percent: int | None, charging: bool, online: bool) -> QIcon:
+    size = 64
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+
+    icon_color = QColor(252, 252, 252, 235 if (online and percent is not None) else 100)
+    tinted_icon = tint_symbolic_icon(symbolic_names, 62, icon_color)
+    painter.drawPixmap(1, 0, tinted_icon)
+
+    label = "--" if (not online or percent is None) else f"{percent}"
+    font = QFont("Sans Serif")
+    font.setBold(True)
+    font.setPixelSize(30 if len(label) <= 2 else 24)
+
+    raw_path = QPainterPath()
+    raw_path.addText(0, 0, font, label)
+    bounds = raw_path.boundingRect()
+
+    offset_x = (size / 2.0) - bounds.center().x()
+    offset_y = (size - 2.5) - bounds.bottom()
+    centered_path = raw_path.translated(offset_x, offset_y)
+
+    outline_pen = QPen(
+        QColor(18, 20, 23, 250),
+        4.8,
+        Qt.PenStyle.SolidLine,
+        Qt.PenCapStyle.RoundCap,
+        Qt.PenJoinStyle.RoundJoin,
+    )
+    painter.setPen(outline_pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.drawPath(centered_path)
+
+    fill_color = PLASMA_WHITE if (online and percent is not None) else QColor(252, 252, 252, 150)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(fill_color)
+    painter.drawPath(centered_path)
+
+    if online and charging:
+        draw_charging_bolt(painter)
+
+    painter.end()
+    return QIcon(pixmap)
+
+
+class PeripheralsTrayApp:
+    def __init__(self, app: QApplication):
+        self.app = app
+        self.idle_seconds = HEADSET_IDLE_REQUIRED
+        self.last_headset_poll = 0.0
+
+        self.wake_watcher = MouseWakeWatcher()
+        self.wake_watcher.mouse_woke_up.connect(self._on_mouse_woke_up)
+
+        self.mouse_tray = QSystemTrayIcon(self.app)
+        self.mouse_menu = QMenu()
+        self.mouse_menu.setObjectName("mouseMenu")
+        m_refresh = QAction("Refresh mouse now", self.mouse_menu)
+        m_refresh.setObjectName("mouseRefresh")
+        m_refresh.triggered.connect(self.update_mouse)
+        m_quit = QAction("Quit", self.mouse_menu)
+        m_quit.setObjectName("mouseQuit")
+        m_quit.triggered.connect(self.app.quit)
+        self.mouse_menu.addAction(m_refresh)
+        self.mouse_menu.addAction(m_quit)
+        self.mouse_tray.setContextMenu(self.mouse_menu)
+        self.mouse_tray.activated.connect(self._on_mouse_activated)
+
+        self.headset_tray = QSystemTrayIcon(self.app)
+        self.headset_menu = QMenu()
+        self.headset_menu.setObjectName("headsetMenu")
+        h_refresh = QAction("Poll headset now", self.headset_menu)
+        h_refresh.setObjectName("headsetRefresh")
+        h_refresh.triggered.connect(lambda: self.update_headset(force=True))
+        h_quit = QAction("Quit", self.headset_menu)
+        h_quit.setObjectName("headsetQuit")
+        h_quit.triggered.connect(self.app.quit)
+        self.headset_menu.addAction(h_refresh)
+        self.headset_menu.addAction(h_quit)
+        self.headset_tray.setContextMenu(self.headset_menu)
+        self.headset_tray.activated.connect(self._on_headset_activated)
+
+        self.update_mouse()
+        self.update_headset(force=False)
+
+        self.mouse_tray.show()
+        self.headset_tray.show()
+        self.wake_watcher.start()
+
+        self.mouse_timer = QTimer()
+        self.mouse_timer.timeout.connect(self.update_mouse)
+        self.mouse_timer.start(MOUSE_POLL_INTERVAL * 1000)
+
+        self.headset_timer = QTimer()
+        self.headset_timer.timeout.connect(self._tick_headset)
+        self.headset_timer.start(AUDIO_CHECK_INTERVAL * 1000)
+
+    def _on_mouse_woke_up(self) -> None:
+        QTimer.singleShot(500, self.update_mouse)
+        QTimer.singleShot(1500, self._retry_if_still_offline)
+        QTimer.singleShot(3000, self._retry_if_still_offline)
+
+    def _retry_if_still_offline(self) -> None:
+        if self.wake_watcher.is_sleeping:
+            self.update_mouse()
+
+    def _on_mouse_activated(self, reason) -> None:
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self.update_mouse()
+
+    def _on_headset_activated(self, reason) -> None:
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self.update_headset(force=True)
+
+    def _tick_headset(self) -> None:
+        if is_any_audio_or_mic_active():
+            self.idle_seconds = 0
+            return
+
+        self.idle_seconds += AUDIO_CHECK_INTERVAL
+        now = time.monotonic()
+
+        if (
+            self.idle_seconds >= HEADSET_IDLE_REQUIRED
+            and (now - self.last_headset_poll) >= HEADSET_MIN_AUTO_INTERVAL
+        ):
+            self.update_headset(force=False)
+
+    def update_mouse(self) -> None:
+        mouse = pb.read_redragon_king_pro()
+        self.wake_watcher.is_sleeping = not mouse["online"]
+
+        icon = build_minimal_icon(
+            ["input-mouse-symbolic", "input-mouse"],
+            mouse["percent"],
+            mouse["charging"],
+            mouse["online"],
+        )
+        self.mouse_tray.setIcon(icon)
+
+        if mouse["online"]:
+            state = "Charging" if mouse["charging"] else "Discharging"
+            self.mouse_tray.setToolTip(
+                f"{mouse['name']}\n{mouse['percent']}% ({state})\nMode: {mouse['mode']} | {mouse['voltage_mv']} mV"
+            )
+        else:
+            self.mouse_tray.setToolTip(f"{mouse['name']}\nStandby (updates on movement)")
+
+    def update_headset(self, force: bool = False) -> None:
+        in_use = is_any_audio_or_mic_active()
+        if in_use and not force:
+            cache = pb.load_cache().get("g435", {})
+            if "percent" in cache:
+                headset = {
+                    "name": "Logitech G435",
+                    "online": True,
+                    "percent": cache["percent"],
+                    "charging": cache.get("charging", False),
+                    "voltage_mv": cache.get("voltage_mv"),
+                    "note": "Audio/Mic active — showing cached value",
+                }
+            else:
+                headset = {
+                    "name": "Logitech G435",
+                    "online": False,
+                    "percent": None,
+                    "charging": False,
+                    "voltage_mv": None,
+                    "note": "Audio/Mic active — click to force poll",
+                }
+        else:
+            headset = pb.read_logitech_g435(force=True)
+            self.last_headset_poll = time.monotonic()
+
+        icon = build_minimal_icon(
+            ["audio-headset-symbolic", "audio-headset"],
+            headset["percent"],
+            headset["charging"],
+            headset["online"],
+        )
+        self.headset_tray.setIcon(icon)
+
+        if headset["online"]:
+            state = "Charging" if headset["charging"] else "Discharging"
+            mv = f" | {headset['voltage_mv']} mV" if headset.get("voltage_mv") else ""
+            note = f"\n({headset['note']})" if headset.get("note") else ""
+            self.headset_tray.setToolTip(
+                f"{headset['name']}\n{headset['percent']}% ({state}){mv}{note}"
+            )
+        else:
+            self.headset_tray.setToolTip(f"{headset['name']}\n{headset.get('note', 'Offline')}")
+
+
+def main() -> None:
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+    app.setApplicationName("Peripherals Battery Tray")
+
+    _tray = PeripheralsTrayApp(app)
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

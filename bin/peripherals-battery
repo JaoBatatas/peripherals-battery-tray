@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+import argparse
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import time
+import hid
+
+CACHE_FILE = os.path.expanduser("~/.cache/peripherals-battery.json")
+
+
+def load_cache() -> dict:
+    try:
+        with open(CACHE_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_cache(data: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
+        with open(CACHE_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+
+def is_g435_audio_active() -> bool:
+    for id_path in glob.glob("/proc/asound/card*/id"):
+        try:
+            with open(id_path, "r") as f:
+                if "G435" not in f.read().upper():
+                    continue
+            card_dir = os.path.dirname(id_path)
+            for status_path in glob.glob(os.path.join(card_dir, "pcm*", "sub*", "status")):
+                with open(status_path, "r") as sf:
+                    if "RUNNING" in sf.read():
+                        return True
+        except Exception:
+            pass
+    return False
+
+
+def read_redragon_king_pro() -> dict:
+    targets = [
+        (0x3554, 0xF5D5, "2.4GHz"),
+        (0x3554, 0xF55E, "USB"),
+    ]
+
+    for vid, pid, mode in targets:
+        paths = [d["path"] for d in hid.enumerate(vid, pid) if d["interface_number"] == 1]
+        if not paths:
+            continue
+
+        dev = None
+        try:
+            dev = hid.device()
+            dev.open_path(paths[0])
+            dev.set_nonblocking(1)
+
+            for _ in range(3):
+                while dev.read(64):
+                    pass
+
+                dev.write([0x08, 0x04] + [0x00] * 14 + [0x49])
+                time.sleep(0.12)
+                rx = dev.read(64)
+
+                if len(rx) >= 10 and rx[0] == 0x08 and rx[1] == 0x04:
+                    connected = rx[5] == 0x02
+                    percent = rx[6]
+                    charging = rx[7] == 0x01
+                    voltage_mv = (rx[8] << 8) | rx[9]
+
+                    if connected and 0 <= percent <= 100:
+                        return {
+                            "name": "Redragon King Pro 1K",
+                            "short": "Mouse",
+                            "online": True,
+                            "percent": percent,
+                            "charging": charging,
+                            "voltage_mv": voltage_mv,
+                            "mode": mode,
+                        }
+        except OSError:
+            pass
+        finally:
+            if dev:
+                try:
+                    dev.close()
+                except Exception:
+                    pass
+
+    return {
+        "name": "Redragon King Pro 1K",
+        "short": "Mouse",
+        "online": False,
+        "percent": None,
+        "charging": False,
+        "voltage_mv": None,
+        "mode": None,
+    }
+
+
+def read_logitech_g435(force: bool = False) -> dict:
+    dongle_present = bool(hid.enumerate(0x046D, 0x0ACB))
+    cache = load_cache()
+    g435_cache = cache.get("g435", {})
+
+    if not dongle_present:
+        return {
+            "name": "Logitech G435",
+            "short": "Headset",
+            "online": False,
+            "percent": None,
+            "charging": False,
+            "voltage_mv": None,
+            "cached": False,
+            "note": "Dongle disconnected",
+        }
+
+    audio_running = is_g435_audio_active()
+    bin_path = shutil.which("g435-tray")
+
+    if not bin_path:
+        return {
+            "name": "Logitech G435",
+            "short": "Headset",
+            "online": False,
+            "percent": None,
+            "charging": False,
+            "voltage_mv": None,
+            "cached": False,
+            "note": "g435-tray not found in PATH",
+        }
+
+    if not audio_running or force:
+        try:
+            res = subprocess.run(
+                [bin_path, "--once"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            out = (res.stdout + "\n" + res.stderr).strip()
+            match = re.search(r"(\d+)\s*%(?:.*?(\d+)\s*mV)?", out, re.IGNORECASE)
+            if match:
+                percent = int(match.group(1))
+                voltage_mv = int(match.group(2)) if match.group(2) else None
+                charging = voltage_mv is not None and voltage_mv >= 4185
+
+                g435_cache = {
+                    "percent": percent,
+                    "charging": charging,
+                    "voltage_mv": voltage_mv,
+                    "ts": int(time.time()),
+                }
+                cache["g435"] = g435_cache
+                save_cache(cache)
+
+                return {
+                    "name": "Logitech G435",
+                    "short": "Headset",
+                    "online": True,
+                    "percent": percent,
+                    "charging": charging,
+                    "voltage_mv": voltage_mv,
+                    "cached": False,
+                    "note": None,
+                }
+        except Exception:
+            pass
+
+    if "percent" in g435_cache:
+        reason = "audio active - cached" if audio_running else "last reading - cached"
+        return {
+            "name": "Logitech G435",
+            "short": "Headset",
+            "online": True,
+            "percent": g435_cache["percent"],
+            "charging": g435_cache.get("charging", False),
+            "voltage_mv": g435_cache.get("voltage_mv"),
+            "cached": True,
+            "note": reason,
+        }
+
+    return {
+        "name": "Logitech G435",
+        "short": "Headset",
+        "online": False,
+        "percent": None,
+        "charging": False,
+        "voltage_mv": None,
+        "cached": False,
+        "note": "Pause audio for 3s for initial reading" if audio_running else "Offline / Standby",
+    }
+
+
+def format_terminal(mouse: dict, headset: dict) -> str:
+    lines = []
+    if mouse["online"]:
+        status = "Charging" if mouse["charging"] else "Discharging"
+        lines.append(f"{mouse['name']}: {mouse['percent']}% [{status}] ({mouse['mode']} | {mouse['voltage_mv']} mV)")
+    else:
+        lines.append(f"{mouse['name']}: Offline / Standby")
+
+    if headset["online"]:
+        status = "Charging" if headset["charging"] else "Discharging"
+        mv_part = f" | {headset['voltage_mv']} mV" if headset.get("voltage_mv") else ""
+        tag = f" ({headset['note']})" if headset.get("cached") and headset.get("note") else ""
+        lines.append(f"{headset['name']}: {headset['percent']}% [{status}]{mv_part}{tag}")
+    else:
+        lines.append(f"{headset['name']}: {headset.get('note', 'Offline / Standby')}")
+
+    return "\n".join(lines)
+
+
+def format_waybar_json(mouse: dict, headset: dict) -> str:
+    parts = []
+    tooltip_lines = []
+
+    if mouse["online"]:
+        bolt = "⚡" if mouse["charging"] else ""
+        parts.append(f"󰍽 {mouse['percent']}%{bolt}")
+        state = "Charging" if mouse["charging"] else "Discharging"
+        tooltip_lines.append(f"{mouse['name']}: {mouse['percent']}% ({state}, {mouse['mode']}, {mouse['voltage_mv']} mV)")
+    else:
+        parts.append("󰍽 --")
+        tooltip_lines.append(f"{mouse['name']}: Offline")
+
+    if headset["online"]:
+        tilde = "~" if headset.get("cached") else ""
+        bolt = "⚡" if headset["charging"] else ""
+        parts.append(f"󰋋 {tilde}{headset['percent']}%{bolt}")
+        state = "Charging" if headset["charging"] else "Discharging"
+        mv_part = f", {headset['voltage_mv']} mV" if headset.get("voltage_mv") else ""
+        cache_part = f" [{headset['note']}]" if headset.get("cached") else ""
+        tooltip_lines.append(f"{headset['name']}: {headset['percent']}% ({state}{mv_part}){cache_part}")
+    else:
+        parts.append("󰋋 --")
+        tooltip_lines.append(f"{headset['name']}: {headset.get('note', 'Offline')}")
+
+    return json.dumps({
+        "text": "  ".join(parts),
+        "tooltip": "\n".join(tooltip_lines),
+    }, ensure_ascii=False)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Battery monitor for Redragon King Pro 1K and Logitech G435")
+    parser.add_argument("--json", action="store_true", help="Output JSON compatible with Waybar/Polybar")
+    parser.add_argument("--watch", type=int, metavar="SECONDS", help="Continuously refresh every N seconds")
+    parser.add_argument("--force", action="store_true", help="Force G435 poll even when audio is active")
+    args = parser.parse_args()
+
+    while True:
+        mouse = read_redragon_king_pro()
+        headset = read_logitech_g435(force=args.force)
+
+        if args.json:
+            print(format_waybar_json(mouse, headset), flush=True)
+        else:
+            if args.watch:
+                print("\033[H\033[J", end="")
+            print(format_terminal(mouse, headset), flush=True)
+
+        if not args.watch:
+            break
+        time.sleep(args.watch)
+
+
+if __name__ == "__main__":
+    main()
